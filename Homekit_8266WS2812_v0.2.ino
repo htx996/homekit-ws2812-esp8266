@@ -3,14 +3,10 @@
   - Web 配网（全中文科技风 UI）
   - 扫描附近 Wi-Fi（异步扫描，不阻塞页面）
   - Web 可配置：LED 数量、LED GPIO（输入数字）
-  - ✅ Web 新增：渐亮时长、渐灭时长（移除 HomeKit 配对码入口）
+  - ✅ Web 新增：HomeKit 配对码、渐亮时长、渐灭时长
   - Web 按钮：重置Wi-Fi / 重启 / 重置HomeKit / 开始AP（全部生效）
   - 开灯渐亮、关灯渐灭（平滑）
   - ✅ 本版修改：所有 GPIO 都允许保存与应用，但对风险脚给出警告（不再拒绝/报错）
-
-  ✅ 重要修复（ESP8266 稳定性）：
-  1) handleRoot() 改用 server.send_P()，避免把整页 HTML 拷贝进 RAM 导致崩溃重启
-  2) CFG_MAGIC 改值，避免旧 cfg.bin 与新结构不匹配造成玄学问题
 */
 
 #include <Arduino.h>
@@ -30,6 +26,7 @@ static const uint8_t  kDefaultLedGpio       = 2;
 static const uint16_t kDefaultFadeMsOn      = 1200;
 static const uint16_t kDefaultFadeMsOff     = 900;
 static const uint32_t kStaConnectTimeoutMs  = 12000;
+static const char*    kDefaultHkPin         = "111-22-333"; // 11122333
 // ============================================================
 
 static const uint8_t DNS_PORT = 53;
@@ -59,13 +56,12 @@ struct AppConfig {
   uint16_t ledCount;
   uint8_t  ledGpio;
 
-  // ✅ 新增：渐变时长
+  // ✅ 新增：HomeKit PIN + 渐变时长
+  char hkPin[11];        // "111-22-333" 10 chars + '\0'
   uint16_t fadeMsOn;     // 50..10000
   uint16_t fadeMsOff;    // 50..10000
 };
-
-// ✅ 结构变更后一定要改 MAGIC，避免旧 cfg.bin 对不上新结构
-static const uint32_t CFG_MAGIC = 0xC0FFEE68;
+static const uint32_t CFG_MAGIC = 0xC0FFEE66;
 static const char* CFG_PATH = "/cfg.bin";
 static AppConfig g_cfg;
 
@@ -170,7 +166,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         </div>
       </div>
 
-      <div class="sec" style="margin-top:16px">渐变参数</div>
+      <div class="sec" style="margin-top:16px">HomeKit & 渐变参数</div>
+      <label>HomeKit 配对码（支持 111-22-333 或 11122333）</label>
+      <input id="hkPin" placeholder="例如：111-22-333"/>
+
       <div class="row">
         <div>
           <label>渐亮时长（ms，50~10000）</label>
@@ -186,6 +185,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         <button class="primary" onclick="save()">保存并应用</button>
       </div>
 
+      <div class="hint">
+        修改 <b>HomeKit 配对码</b> 后会自动清空配对信息并重启，需要在 Home App 重新添加。
+      </div>
       <div class="status" id="status"><span class="dot"></span>等待操作…</div>
     </div>
 
@@ -222,6 +224,7 @@ async function loadCfg(){
     document.getElementById('ledCount').value=c.ledCount||30;
     document.getElementById('ledGpio').value=c.ledGpio||2;
 
+    document.getElementById('hkPin').value=c.hkPin||'111-22-333';
     document.getElementById('fadeOn').value=c.fadeMsOn||1200;
     document.getElementById('fadeOff').value=c.fadeMsOff||900;
 
@@ -282,10 +285,12 @@ async function save(){
   const ledCount=document.getElementById('ledCount').value;
   const ledGpio=document.getElementById('ledGpio').value;
 
+  const hkPin=document.getElementById('hkPin').value.trim();
   const fadeOn=document.getElementById('fadeOn').value;
   const fadeOff=document.getElementById('fadeOff').value;
 
   if(!ssid){ setStatus(false,'请填写 Wi-Fi 名称（SSID）'); return; }
+  if(!hkPin){ setStatus(false,'请填写 HomeKit 配对码'); return; }
 
   setStatus(true,'正在保存并应用…');
 
@@ -293,6 +298,7 @@ async function save(){
   fd.set('ssid',ssid); fd.set('pass',pass);
   fd.set('ledCount',ledCount); fd.set('ledGpio',ledGpio);
 
+  fd.set('hkPin', hkPin);
   fd.set('fadeOn', fadeOn);
   fd.set('fadeOff', fadeOff);
 
@@ -348,6 +354,58 @@ static String jsonEscape(const String& s) {
   return o;
 }
 
+// ======================= HomeKit PIN 规范化 =======================
+// 支持输入：
+// - "111-22-333"（10字符）
+// - "11122333"（8数字） -> 自动转成 111-22-333
+static bool normalizeHkPin(const String& in, char outPin[11]) {
+  String s = in;
+  s.trim();
+  if (s.length() == 0) return false;
+
+  // 若是 8 位纯数字
+  bool allDigit = true;
+  if (s.length() == 8) {
+    for (int i = 0; i < 8; i++) if (s[i] < '0' || s[i] > '9') allDigit = false;
+    if (allDigit) {
+      // 11122333 -> 111-22-333
+      outPin[0]=s[0]; outPin[1]=s[1]; outPin[2]=s[2];
+      outPin[3]='-';
+      outPin[4]=s[3]; outPin[5]=s[4];
+      outPin[6]='-';
+      outPin[7]=s[5]; outPin[8]=s[6]; outPin[9]=s[7];
+      outPin[10]='\0';
+      return true;
+    }
+  }
+
+  // 若是 10 字符格式：xxx-xx-xxx
+  if (s.length() == 10 && s[3]=='-' && s[6]=='-') {
+    // 检查其他都是数字
+    for (int i=0;i<10;i++){
+      if (i==3 || i==6) continue;
+      if (s[i]<'0' || s[i]>'9') return false;
+    }
+    strncpy(outPin, s.c_str(), 10);
+    outPin[10]='\0';
+    return true;
+  }
+
+  return false;
+}
+
+static bool isHkPinValidStored(const char pin[11]) {
+  if (!pin) return false;
+  // 必须是 xxx-xx-xxx
+  if (strlen(pin) != 10) return false;
+  if (pin[3] != '-' || pin[6] != '-') return false;
+  for (int i=0;i<10;i++){
+    if (i==3 || i==6) continue;
+    if (pin[i]<'0' || pin[i]>'9') return false;
+  }
+  return true;
+}
+
 // ======================= 工具函数 =======================
 static String chipSuffix() {
   uint32_t id = ESP.getChipId();
@@ -361,6 +419,8 @@ static void setDefaultConfig() {
   g_cfg.magic = CFG_MAGIC;
   g_cfg.ledCount = kDefaultLedCount;
   g_cfg.ledGpio  = kDefaultLedGpio;
+
+  strncpy(g_cfg.hkPin, kDefaultHkPin, sizeof(g_cfg.hkPin)-1);
   g_cfg.fadeMsOn  = kDefaultFadeMsOn;
   g_cfg.fadeMsOff = kDefaultFadeMsOff;
 }
@@ -390,6 +450,13 @@ static bool loadConfig() {
   if (g_cfg.ledCount > 500) g_cfg.ledCount = 500;
   if (g_cfg.ledGpio > 16) g_cfg.ledGpio = kDefaultLedGpio;
 
+  // PIN 校验
+  if (!isHkPinValidStored(g_cfg.hkPin)) {
+    strncpy(g_cfg.hkPin, kDefaultHkPin, sizeof(g_cfg.hkPin)-1);
+    g_cfg.hkPin[10]='\0';
+  }
+
+  // 渐变校验
   if (g_cfg.fadeMsOn < 50) g_cfg.fadeMsOn = 50;
   if (g_cfg.fadeMsOn > 10000) g_cfg.fadeMsOn = 10000;
   if (g_cfg.fadeMsOff < 50) g_cfg.fadeMsOff = 50;
@@ -447,6 +514,7 @@ static void pixelsRecreate() {
   g_pixels->begin();
   g_pixels->show();
 
+  // 重置缓存，确保下一次一定刷新
   g_lastR = g_lastG = g_lastB = 255;
   g_lastCount = 0;
   g_lastOn = !g_lastOn;
@@ -495,6 +563,7 @@ static void updateFade() {
     return;
   }
 
+  // ✅ 改成用配置里的渐变时长
   uint16_t totalMs = hk_targetOn ? g_cfg.fadeMsOn : g_cfg.fadeMsOff;
   if (totalMs < 50) totalMs = 50;
 
@@ -539,13 +608,16 @@ static void startHomeKitIfNeeded() {
   if (g_homekitRunning) return;
   if (WiFi.status() != WL_CONNECTED) return;
 
+  // ✅ 用配置里的 PIN 覆盖 HomeKit server 密码
+  hk_config.password = g_cfg.hkPin;
+
   arduino_homekit_setup(&hk_config);
   g_homekitRunning = true;
 }
 
 // ======================= Web handlers =======================
 static void handleRoot() {
-  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+  server.send(200, "text/html; charset=utf-8", FPSTR(INDEX_HTML));
 }
 
 static void handleConfig() {
@@ -557,6 +629,7 @@ static void handleConfig() {
   json += "\"ledCount\":" + String(g_cfg.ledCount) + ",";
   json += "\"ledGpio\":" + String(g_cfg.ledGpio) + ",";
   json += "\"gpioNote\":\"" + jsonEscape(note) + "\",";
+  json += "\"hkPin\":\"" + jsonEscape(String(g_cfg.hkPin)) + "\",";
   json += "\"fadeMsOn\":" + String(g_cfg.fadeMsOn) + ",";
   json += "\"fadeMsOff\":" + String(g_cfg.fadeMsOff) + ",";
   json += "\"apMode\":" + String(g_apEnabled ? "true" : "false") + ",";
@@ -634,6 +707,9 @@ static void handleSave() {
   int ledCountInt = server.arg("ledCount").toInt();
   int ledGpioInt  = server.arg("ledGpio").toInt();
 
+  String hkPinIn = server.hasArg("hkPin") ? server.arg("hkPin") : "";
+  hkPinIn.trim();
+
   int fadeOnInt  = server.hasArg("fadeOn")  ? server.arg("fadeOn").toInt()  : (int)g_cfg.fadeMsOn;
   int fadeOffInt = server.hasArg("fadeOff") ? server.arg("fadeOff").toInt() : (int)g_cfg.fadeMsOff;
 
@@ -642,12 +718,14 @@ static void handleSave() {
     return;
   }
 
-  // 密码留空但 SSID 不变 -> 保留旧密码
+  // ---------- ✅ 核心修复：密码留空但 SSID 不变 -> 保留旧密码 ----------
   String oldSsid = String(g_cfg.ssid);
   String oldPass = String(g_cfg.pass);
+
   if (pass.length() == 0 && ssid == oldSsid && oldPass.length() > 0) {
     pass = oldPass;
   }
+  // -------------------------------------------------------------
 
   // LED 数量
   uint16_t ledCount = (uint16_t)ledCountInt;
@@ -661,6 +739,14 @@ static void handleSave() {
   }
   uint8_t ledGpio = (uint8_t)ledGpioInt;
 
+  // PIN：允许输入 11122333 或 111-22-333
+  char newPin[11];
+  if (!normalizeHkPin(hkPinIn, newPin)) {
+    server.send(400, "text/plain; charset=utf-8",
+                "HomeKit 配对码格式错误。\n支持：111-22-333 或 11122333（8位数字）。");
+    return;
+  }
+
   // 渐变：50~10000
   uint16_t fadeOn  = (uint16_t)fadeOnInt;
   uint16_t fadeOff = (uint16_t)fadeOffInt;
@@ -669,13 +755,14 @@ static void handleSave() {
   if (fadeOff < 50) fadeOff = 50;
   if (fadeOff > 10000) fadeOff = 10000;
 
-  // GPIO 警告（不拦截）
+  // ✅ GPIO 警告（不拦截）
   String warnGpio = "";
   if (isGpioWarn(ledGpio)) warnGpio = gpioWarnText(ledGpio);
 
   bool ledChanged   = (g_cfg.ledCount != ledCount) || (g_cfg.ledGpio != ledGpio);
   bool wifiChanged  = (oldSsid != ssid) || (oldPass != pass);
   bool fadeChanged  = (g_cfg.fadeMsOn != fadeOn) || (g_cfg.fadeMsOff != fadeOff);
+  bool pinChanged   = (String(g_cfg.hkPin) != String(newPin));
 
   // 写回配置
   g_cfg.magic = CFG_MAGIC;
@@ -687,6 +774,9 @@ static void handleSave() {
 
   g_cfg.ledCount = ledCount;
   g_cfg.ledGpio  = ledGpio;
+
+  memset(g_cfg.hkPin, 0, sizeof(g_cfg.hkPin));
+  strncpy(g_cfg.hkPin, newPin, sizeof(g_cfg.hkPin) - 1);
 
   g_cfg.fadeMsOn  = fadeOn;
   g_cfg.fadeMsOff = fadeOff;
@@ -703,6 +793,29 @@ static void handleSave() {
     applyLedOutput();
   }
 
+  // 渐变参数立即生效：updateFade() 会读 g_cfg.fadeMsOn/Off
+  // 不需要额外动作，只提示一下即可。
+
+  // 配对码变更：必须重置配对 + 重启
+  if (pinChanged) {
+    String msg = "保存成功，配置已应用。";
+    msg += "\n✅ HomeKit 配对码已更新为：";
+    msg += String(g_cfg.hkPin);
+    msg += "\n⚠️ 因为配对码变更，需要清空 HomeKit 配对信息并重启。";
+    if (warnGpio.length()) {
+      msg += "\n⚠️ GPIO 警告：GPIO";
+      msg += String(ledGpio);
+      msg += "：";
+      msg += warnGpio;
+    }
+    server.send(200, "text/plain; charset=utf-8", msg);
+
+    // 立刻清配对并重启（让新 PIN 生效）
+    homekit_storage_reset();
+    delayedRestart(600);
+    return;
+  }
+
   // WiFi 参数变更：尝试立即连接；失败则自动开 AP 叠加救援
   String connMsg = "";
   if (wifiChanged) {
@@ -712,7 +825,9 @@ static void handleSave() {
       startHomeKitIfNeeded();
       connMsg += "\n✅ 已连接 Wi-Fi：";
       connMsg += WiFi.localIP().toString();
-      connMsg += "\nHomeKit 已可用。";
+      connMsg += "\nHomeKit 已可用（配对码：";
+      connMsg += String(g_cfg.hkPin);
+      connMsg += "）。";
     } else {
       enableAPOverlay();
       connMsg += "\n❌ 连接失败：请检查密码/信号。";
@@ -721,10 +836,12 @@ static void handleSave() {
       connMsg += "】后访问 192.168.4.1 重新配网。";
     }
   } else {
-    connMsg = "\n✅ Wi-Fi 参数未变更（仅应用灯带/渐变参数），不会影响已配网状态。";
+    connMsg = "\n✅ Wi-Fi 参数未变更（仅应用灯带/HomeKit/渐变参数），不会影响已配网状态。";
   }
 
   String okMsg = "保存成功，配置已应用。";
+  okMsg += "\nHomeKit 配对码：";
+  okMsg += String(g_cfg.hkPin);
 
   if (fadeChanged) {
     okMsg += "\n✅ 渐变时长已更新：渐亮 ";

@@ -1,12 +1,13 @@
 /*
   HomeKit WS2812 Controller (ESP8266 / ESP-12F)
-  - Web 配网（全中文科技风 UI）
+  - Web 配网（全中文UI）
   - 扫描附近 Wi-Fi（异步扫描，不阻塞页面）
   - Web 可配置：LED 数量、LED GPIO（输入数字）
-  - ✅ Web 新增：HomeKit 配对码、渐亮时长、渐灭时长
+  - Web 新增：HomeKit 配对码、渐亮时长、渐灭时长
   - Web 按钮：重置Wi-Fi / 重启 / 重置HomeKit / 开始AP（全部生效）
   - 开灯渐亮、关灯渐灭（平滑）
-  - ✅ 本版修改：所有 GPIO 都允许保存与应用，但对风险脚给出警告（不再拒绝/报错）
+  - 本版修改：所有 GPIO 都允许保存与应用，但对风险脚给出警告（不再拒绝/报错）
+  - v0.2
 */
 
 #include <Arduino.h>
